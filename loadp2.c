@@ -249,7 +249,21 @@ readElfFile(FILE *infile, ElfHdr *hdr)
         if (program.type != PT_LOAD) {
             continue;
         }
-        //printf("load %d bytes at %x\n", program.filesz, program.paddr);
+
+        int num_sections = 0; // track number of loadable sections in this program
+        // for every section, count up how many sections we have
+        for (i = 0; i < c->hdr.shnum; ++i) {
+            ElfSectionHdr sec;
+            LoadSectionTableEntry(c, i, &sec);
+            if (SectionInProgramSegment(&sec, &program)) {
+                if (sec.type != ST_NOBITS)
+                    num_sections++;
+            }
+        }
+
+        if (num_sections == 0) continue; // we have no loadable sections, skip this segment
+
+        // printf("load %d bytes at %x\n", program.filesz, program.paddr);
         if (program.paddr < base) {
             base = program.paddr;
         }
@@ -280,6 +294,20 @@ readElfFile(FILE *infile, ElfHdr *hdr)
         if (program.type != PT_LOAD) {
             continue;
         }
+
+        int num_sections = 0; // track number of loadable sections in this program
+        // for every section, count up how many sections we have
+        for (i = 0; i < c->hdr.shnum; ++i) {
+            ElfSectionHdr sec;
+            LoadSectionTableEntry(c, i, &sec);
+            if (SectionInProgramSegment(&sec, &program)) {
+                if (sec.type != ST_NOBITS)
+                    num_sections++;
+            }
+        }
+
+        if (num_sections == 0) continue; // we have no loadable sections, skip this segment
+
         fseek(infile, program.offset, SEEK_SET);
         r = fread(g_filedata + program.paddr - base, 1, program.filesz, infile);
         if (r != program.filesz) {
@@ -287,7 +315,7 @@ readElfFile(FILE *infile, ElfHdr *hdr)
             return -1;
         }
     }
-    //printf("ELF: total size = %d\n", size);
+    printf("ELF: total size = %d\n", size);
     return size;
 }
 
