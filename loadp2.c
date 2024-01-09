@@ -257,8 +257,8 @@ readElfFile(FILE *infile, ElfHdr *hdr)
             printf("bad ELF file: program size in file too big\n");
             return -1;
         }
-        if (program.paddr + program.memsz > top) {
-            top = program.paddr + program.memsz;
+        if (program.paddr + program.filesz > top) {
+            top = program.paddr + program.filesz;
         }
     }
     size = top - size;

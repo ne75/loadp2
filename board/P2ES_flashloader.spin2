@@ -286,7 +286,7 @@ ser_string	long	0
 
 '==============================================================================================
 con
-	SERIAL_BAUD     = 230_400
+	SERIAL_BAUD     = 2_000_000
 	XTALFREQ	= 20_000_000			'PLL stage 0: crystal frequency
 	XDIV		= 2				'PLL stage 1: crystal divider (1..64)
 	XMUL		= 16				'PLL stage 2: crystal / div * mul (1..1024)

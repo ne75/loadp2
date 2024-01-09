@@ -49,7 +49,7 @@ endif
 BOARDS=board/P2ES_flashloader.bin board/P2ES_sdcard.bin
 
 # program for converting MainLoader.spin2 to MainLoader.binary
-P2ASM=flexspin -2
+P2ASM=/opt/flex/bin/flexspin -2
 
 # docs
 DOCS=README.md LICENSE
