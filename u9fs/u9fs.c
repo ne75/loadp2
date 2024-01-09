@@ -274,8 +274,15 @@ getfcallnew(int fd, Fcall *fc, int have)
         } else {
             read_from_have = totallen;
         }
+#if 0
+        printf("about to call convM2S:\n");
+        for (int i = 0; i < totallen; i++) {
+            printf("  %02x", rxbuf[i]);
+        }
+        printf("\n");
+#endif        
 	if( (r = convM2S(rxbuf, totallen, fc)) != totallen) {
-            sysfatal("badly sized message type %d: expected %d got %d", rxbuf[0], totallen, r);
+            sysfatal("badly sized message type %d: expected %d got %d", rxbuf[4], totallen, r);
             return read_from_have;
         }
         return read_from_have;
@@ -522,9 +529,11 @@ rwalk(Fcall *rx, Fcall *tx)
 
 	path = estrdup(fid->path);
 	e = nil;
-	for(i=0; i<rx->nwname; i++)
+	for(i=0; i<rx->nwname; i++) {
 		if(userwalk(fid->u, &path, rx->wname[i], &tx->wqid[i], &e) < 0)
 			break;
+                //printf("walk: path=[%s]\n", path);
+        }
 
 	if(i == rx->nwname){		/* successful clone or walk */
 		tx->nwqid = i;
@@ -949,6 +958,7 @@ rwstat(Fcall *rx, Fcall *tx)
 	Fid *fid;
 
 	if((fid = oldfid(rx->fid, &e)) == nil){
+            	//printf("wstat: oldfid failed\n");
 		seterror(tx, e);
 		return;
 	}
@@ -961,11 +971,13 @@ rwstat(Fcall *rx, Fcall *tx)
 	 * half broken and return an error.  it's hardly perfect.
 	 */
 	if(convM2D(rx->stat, rx->nstat, &d, (char*)rx->stat) <= BIT16SZ){
+            	//printf("wstat: convM2D failed\n");
 		seterror(tx, Ewstatbuffer);
 		return;
 	}
 
 	if(fidstat(fid, &e) < 0){
+            	//printf("wstat: fidstat failed\n");
 		seterror(tx, e);
 		return;
 	}
@@ -1045,14 +1057,15 @@ rwstat(Fcall *rx, Fcall *tx)
 	if(d.name[0]){
 		old = fid->path;
 		dir = estrdup(fid->path);
-		if((p = strrchr(dir, '/')) > dir)
+		if((p = strrchr(dir, '/')) >= dir)
 			*p = '\0';
 		else{
-			seterror(tx, "whoops: can't happen in u9fs");
+			seterror(tx, "whoops: found no / in old path");
 			return;
 		}
 		new = estrpath(dir, d.name, 1);
 		npath = rootpath(new);
+                //printf("wstat: checkpath(%s, %s) && rename(%s, %s)\n", old, new, opath, npath);
 		if(strcmp(old, new) != 0 && rename(opath, npath) < 0){
 			if(chatty9p)
 				fprint(2, "rename(%s, %s) failed\n", old, new);

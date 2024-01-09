@@ -57,7 +57,7 @@ DOCS=README.md LICENSE
 # default build target
 default: $(BUILD)/loadp2$(EXT) $(BOARDS)
 
-HEADERS=MainLoader_fpga.h MainLoader_chip.h
+HEADERS=MainLoader_fpga.h MainLoader_chip.h flash_loader.h
 
 U9FS=u9fs/u9fs.c u9fs/authnone.c u9fs/print.c u9fs/doprint.c u9fs/rune.c u9fs/fcallconv.c u9fs/dirmodeconv.c u9fs/convM2D.c u9fs/convS2M.c u9fs/convD2M.c u9fs/convM2S.c u9fs/readn.c
 
@@ -71,7 +71,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 %.h: %.bin
-	xxd -i $< > $@
+	xxd -i $< $@
 
 SD_SRCS=board/sdcard/Makefile board/sdcard/sdboot.c board/sdcard/sdmm.c board/sdcard/ff.c board/sdcard/diskio.h board/sdcard/ffconf.h board/sdcard/ff.c
 
