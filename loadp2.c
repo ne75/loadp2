@@ -1,7 +1,7 @@
 /*
  *
  * Copyright (c) 2017-2019 by Dave Hein
- * Copyright (c) 2019-2022 Total Spectrum Software Inc.
+ * Copyright (c) 2019-2023 Total Spectrum Software Inc.
  * Based on p2load written by David Betz
  *
  * MIT License
@@ -33,6 +33,11 @@
 #include "osint.h"
 #include "loadelf.h"
 
+#define ARGV_ADDR  0xFC000
+#define ARGV_MAGIC ('A' | ('R' << 8) | ('G'<<16) | ('v'<<24))
+#define ARGV_MAX_BYTES 1020
+#define ARGC_MAX_ITEMS 32
+
 /* default FIFO size of FT231X in P2-EVAL board and PropPlugs */
 //#define DEFAULT_FIFO_SIZE   512
 #define DEFAULT_FIFO_SIZE   1024 /* seems to work better */
@@ -44,6 +49,9 @@
 #define LOAD_CHIP   0
 #define LOAD_FPGA   1
 #define LOAD_SINGLE 2
+#define LOAD_SPI    3
+
+#define ROUND_UP(x) (((x)+3) & ~3)
 
 static int loader_baud = 2000000;
 static int clock_mode = -1;
@@ -56,6 +64,8 @@ static int use_checksum = 1;
 static int quiet_mode = 0;
 static int enter_rom = NO_ENTER;
 static char *send_script = NULL;
+static int mem_argv_bytes = 0;
+static char *mem_argv_data = NULL;
 
 int get_loader_baud(int ubaud, int lbaud);
 static void RunScript(char *script);
@@ -74,6 +84,7 @@ static void RunScript(char *script);
 
 #include "MainLoader_fpga.h"
 #include "MainLoader_chip.h"
+#include "flash_loader.h"
 
 static int32_t ibuf[256];
 static int32_t ibin[32];
@@ -84,6 +95,8 @@ int waitAtExit = 0;
 static int force_zero = 0;  /* default to zeroing memory */
 static int do_hwreset = 1;
 static int fifo_size = DEFAULT_FIFO_SIZE;
+
+int ignoreEof = 0;
 
 /* duplicate a string, useful if our original string might
  * not be modifiable
@@ -121,7 +134,7 @@ static void Usage(const char *msg)
         printf("%s\n", msg);
     }
 printf("\
-loadp2 - a loader for the propeller 2 - version 0.053 " __DATE__ "\n\
+loadp2 - a loader for the propeller 2 - version 0.071 " __DATE__ "\n\
 usage: loadp2\n\
          [ -p port ]               serial port\n\
          [ -b baud ]               user baud rate (default is %d)\n\
@@ -145,12 +158,15 @@ usage: loadp2\n\
          [ -xTERM ]                enter terminal, avoid reset\n\
          [ -CHIP ]                 set load mode for CHIP\n\
          [ -FPGA ]                 set load mode for FPGA\n\
-         [ -PATCH ]                patch in clock frequency and serial parms\n\
          [ -NOZERO ]               do not clear memory before download (default)\n\
          [ -ZERO ]                 clear memory before download\n\
+         [ -PATCH ]                patch in clock frequency and serial parms\n\
          [ -SINGLE ]               set load mode for single stage\n\
+         [ -SPI ]                  like -SINGLE, but copies application to SPI flash\n\
+         [ -NOEOF ]                ignore EOF on input\n\
          filespec                  file to load\n\
          [ -e script ]             send a sequence of characters after starting P2\n\
+         [ -a arg1 [arg2 ...] ]    put arguments for program into memory\n\
 ", user_baud, loader_baud, clock_freq, clock_mode, DEFAULT_FIFO_SIZE);
 printf("\n\
 In -CHIP mode, filespec may optionally be multiple files with address\n\
@@ -224,9 +240,11 @@ int g_fileptr;
 
 /*
  * read an ELF file into memory
+ * optionally prepends a block of data
+ * to the file (if prepend_data is non-NULL)
  */
-int
-readElfFile(FILE *infile, ElfHdr *hdr)
+static int
+readElfFile(FILE *infile, ElfHdr *hdr, uint8_t *prepend_data, int prepend_size)
 {
     ElfContext *c;
     ElfProgramHdr program;
@@ -234,6 +252,7 @@ readElfFile(FILE *infile, ElfHdr *hdr)
     unsigned int base = -1;
     unsigned int top = 0;
     int i, r;
+    uint8_t *program_mem;
     
     c = OpenElfFile(infile, hdr);
     if (!c) {
@@ -249,7 +268,21 @@ readElfFile(FILE *infile, ElfHdr *hdr)
         if (program.type != PT_LOAD) {
             continue;
         }
-        //printf("load %d bytes at %x\n", program.filesz, program.paddr);
+
+        int num_sections = 0; // track number of loadable sections in this program
+        // for every section, count up how many sections we have
+        for (i = 0; i < c->hdr.shnum; ++i) {
+            ElfSectionHdr sec;
+            LoadSectionTableEntry(c, i, &sec);
+            if (SectionInProgramSegment(&sec, &program)) {
+                if (sec.type != ST_NOBITS)
+                    num_sections++;
+            }
+        }
+
+        if (num_sections == 0) continue; // we have no loadable sections, skip this segment
+
+        // printf("load %d bytes at %x\n", program.filesz, program.paddr);
         if (program.paddr < base) {
             base = program.paddr;
         }
@@ -266,12 +299,20 @@ readElfFile(FILE *infile, ElfHdr *hdr)
         printf("image size %d bytes is too large to handle\n", size);
         return -1;
     }
+    size += prepend_size;
     g_filedata = (uint8_t *)calloc(1, size);
     if (!g_filedata) {
         printf("Could not allocate %d bytes\n", size);
         return -1;
     }
     g_filesize = size;
+    if (prepend_data && prepend_size > 0) {
+        program_mem = g_filedata + prepend_size;
+        memcpy(g_filedata, prepend_data, prepend_size);
+    } else {
+        program_mem = g_filedata;
+    }
+    
     for (i = 0; i < c->hdr.phnum; i++) {
         if (!LoadProgramTableEntry(c, i, &program)) {
             printf("Error reading ELF program header %d\n", i);
@@ -280,14 +321,28 @@ readElfFile(FILE *infile, ElfHdr *hdr)
         if (program.type != PT_LOAD) {
             continue;
         }
+
+        int num_sections = 0; // track number of loadable sections in this program
+        // for every section, count up how many sections we have
+        for (i = 0; i < c->hdr.shnum; ++i) {
+            ElfSectionHdr sec;
+            LoadSectionTableEntry(c, i, &sec);
+            if (SectionInProgramSegment(&sec, &program)) {
+                if (sec.type != ST_NOBITS)
+                    num_sections++;
+            }
+        }
+
+        if (num_sections == 0) continue; // we have no loadable sections, skip this segment
+
         fseek(infile, program.offset, SEEK_SET);
-        r = fread(g_filedata + program.paddr - base, 1, program.filesz, infile);
+        r = fread(program_mem + program.paddr - base, 1, program.filesz, infile);
         if (r != program.filesz) {
             printf("read error in ELF file\n");
             return -1;
         }
     }
-    //printf("ELF: total size = %d\n", size);
+    printf("ELF: total size = %d\n", size);
     return size;
 }
 
@@ -296,14 +351,18 @@ readElfFile(FILE *infile, ElfHdr *hdr)
  * sets g_filedata to point to the data, 
  * and g_filesize to the length
  * returns g_filesize, or -1 on error
+ * if prepend_data is non-NULL and prepend_size > 0,
+ * then that data is prepended to the total to be downloaded
  */
 
-int 
-readBinaryFile(char *fname)
+static int 
+readBinaryFile(char *fname, uint8_t *prepend_data, int prepend_size)
 {
     int size;
+    int fsize;
     FILE *infile;
     ElfHdr hdr;
+    uint8_t *progbase;
     
     g_fileptr = 0;
     infile = fopen(fname, "rb");
@@ -314,21 +373,35 @@ readBinaryFile(char *fname)
     }
     if (ReadAndCheckElfHdr(infile, &hdr)) {
         /* this is an ELF file, load using ReadElf instead */
-        return readElfFile(infile, &hdr);
+        return readElfFile(infile, &hdr, prepend_data, prepend_size);
     } else {
         //printf("not an ELF file\n");
     }
     
     fseek(infile, 0, SEEK_END);
-    size = ftell(infile);
+    fsize = ftell(infile);
     fseek(infile, 0, SEEK_SET);
+    size = ROUND_UP(fsize + prepend_size);
     g_filedata = (uint8_t *)malloc(size);
     if (!g_filedata) {
         printf("Could not allocate %d bytes\n", size);
         return -1;
     }
-    size = g_filesize = fread(g_filedata, 1, size, infile);
+    if (prepend_data && prepend_size) {
+        memcpy(g_filedata, prepend_data, prepend_size);
+    }
+    progbase = g_filedata + prepend_size;
+    int origFsize = fsize;
+    fsize = fread(progbase, 1, fsize, infile);
     fclose(infile);
+    if (fsize <= 0) {
+        size = g_filesize = fsize;
+    } else {
+        if (fsize != origFsize) {
+            printf("WARNING: short read of file\n");
+        }
+        size = g_filesize = ROUND_UP(fsize + prepend_size);
+    }
     return size;
 }
 
@@ -348,14 +421,40 @@ loadBytes(char *buffer, int size)
     return r;
 }
 
+static void
+patchBinaryFileForFlash(int total_size, int header_len) {
+    int size = total_size;
+    uint32_t *lptr;
+    uint32_t chksum = 0;
+    if (size & 3) {
+        printf("Error: flashing a file that is not a multiple of 4 bytes long\n");
+        promptexit(1);
+    }
+    lptr = (uint32_t *)g_filedata;
+    lptr[2] = 0;                    // NOP out the DEBUG flag *before* calculating checksum
+    size /= 4;
+    for (int i = 0; i < size; i++) {
+        chksum += lptr[i];
+    }
+    lptr = (uint32_t *)g_filedata;  // go to the header
+    lptr[1] = -chksum;              // patch in the - chksum
+}
+
 int loadfilesingle(char *fname)
 {
     int num, size, i;
     int patch = patch_mode;
-    int totnum = 0;
     int checksum = 0;
 
-    size = readBinaryFile(fname);
+    if (load_mode == LOAD_SPI) {
+        size = readBinaryFile(fname, (uint8_t *)flash_loader_bin, flash_loader_bin_len);
+        // need to patch up the binary
+        if (size > 0) {
+            patchBinaryFileForFlash(size, flash_loader_bin_len);
+        }
+    } else {
+        size = readBinaryFile(fname, NULL, 0);
+    }
     if (size < 0) {
         return 1;
     }
@@ -380,7 +479,6 @@ int loadfilesingle(char *fname)
             sprintf( &buffer[i*3], " %2.2x", binbuffer[i] & 255 );
         strcat(buffer, " > ");
         tx( (uint8_t *)buffer, strlen(buffer) );
-        totnum += num;
     }
     if (use_checksum)
     {
@@ -391,8 +489,9 @@ int loadfilesingle(char *fname)
         tx( (uint8_t *)buffer, strlen(buffer) );
         tx((uint8_t *)"?", 1);
         wait_drain();
-        msleep(100+fifo_size*10*1000/loader_baud);
-        num = rx_timeout((uint8_t *)buffer, 1, 100);
+        //msleep(100+fifo_size*10*1000/loader_baud);
+        //num = rx_timeout((uint8_t *)buffer, 1, 100);
+        num = rx_timeout((uint8_t *)buffer, 1, 100 + fifo_size*10000/loader_baud);
         if (num >= 0) buffer[num] = 0;
         else buffer[0] = 0;
         if (strcmp(buffer, "."))
@@ -402,7 +501,7 @@ int loadfilesingle(char *fname)
             promptexit(1);
         }
         if (verbose)
-            printf("Checksum validated\n");
+            printf("Checksum (0x%08x) validated\n", checksum);
     }
     else
     {
@@ -411,7 +510,7 @@ int loadfilesingle(char *fname)
         msleep(fifo_size*10*1000/loader_baud);
     }
 
-    msleep(100);
+//    msleep(100);
     if (verbose) printf("%s loaded\n", fname);
     return 0;
 }
@@ -425,11 +524,9 @@ static unsigned flag_bits()
 int loadfileFPGA(char *fname, int address)
 {
     int num, size;
-    int totnum = 0;
     int patch = patch_mode;
-    unsigned chksum = 0;
 
-    size = readBinaryFile(fname);
+    size = readBinaryFile(fname, NULL, 0);
     if (size < 0)
     {
         printf("Could not open %s\n", fname);
@@ -452,7 +549,6 @@ int loadfileFPGA(char *fname, int address)
     if (verbose) printf("Loading %s - %d bytes\n", fname, size);
     while ((num=loadBytes(buffer, 1024)))
     {
-        int i;
         if (patch)
         {
             patch = 0;
@@ -461,10 +557,6 @@ int loadfileFPGA(char *fname, int address)
             memcpy(&buffer[0x1c], &user_baud, 4);
         }
         tx((uint8_t *)buffer, num);
-        totnum += num;
-        for (i = 0; i < num; i++) {
-            chksum += buffer[i];
-        }
     }
     wait_drain();
     msleep(100);
@@ -478,6 +570,7 @@ static char *getNextFile(char *fname, char **next_p, int *address_p)
     char *next = fname;
 
     if (!*fname) {
+        *next_p = NULL;
         return NULL;
     }
     if (*fname == '@') {
@@ -499,23 +592,54 @@ static char *getNextFile(char *fname, char **next_p, int *address_p)
     return fname;
 }
 
+static int verify_chksum(unsigned chksum)
+{
+    unsigned recv_chksum = 0;
+    int num;
+    wait_drain();
+    //msleep(1+fifo_size*10*1000/loader_baud);
+    //num = rx_timeout((uint8_t *)buffer, 3, 400);
+    num = rx_timeout((uint8_t *)buffer, 3, 400 + fifo_size*10000/loader_baud);
+    if (num != 3) {
+        printf("ERROR: timeout waiting for checksum at end: got %d\n", num);
+        printf("Try increasing the FIFO setting if not large enough for your setup\n");
+        promptexit(1);
+    }
+    recv_chksum = (buffer[0] - '@') << 4;
+    recv_chksum += (buffer[1] - '@');
+    chksum &= 0xff;
+    if (recv_chksum != (chksum & 0xff)) {
+        printf("ERROR: bad checksum, expected %02x got %02x (chksum characters %c%c%c)\n", chksum, recv_chksum, buffer[0], buffer[1], buffer[2]);
+        promptexit(1);
+    }
+    if (verbose) printf("chksum: %x OK\n", recv_chksum);
+    return 0;
+}
+
 int loadfile(char *fname, int address)
 {
     int num, size;
-    int totnum = 0;
     int patch = patch_mode;
     unsigned chksum;
     char *next_fname = NULL;
     int send_size;
     
-    if (load_mode == LOAD_SINGLE) {
+    if (load_mode == LOAD_SINGLE || load_mode == LOAD_SPI) {
         if (address != 0) {
-            printf("ERROR: -SINGLE can only load at address 0\n");
+            printf("ERROR: -SINGLE and -SPI can only load at address 0\n");
+            promptexit(1);
+        }
+        if (mem_argv_bytes != 0) {
+            printf("ERROR: ARGv is not compatible with -SINGLE and -SPI\n");
             promptexit(1);
         }
         return loadfilesingle(fname);
     }
     if (load_mode == LOAD_FPGA) {
+        if (mem_argv_bytes != 0) {
+            printf("ERROR: ARGv is not compatible with LOAD_FPGAn");
+            promptexit(1);
+        }
         return loadfileFPGA(fname, address);
     }
     
@@ -570,15 +694,16 @@ int loadfile(char *fname, int address)
     
     do {
         fname = getNextFile(fname, &next_fname, &address);
-        if (!next_fname) break; /* no more files */
-
+        if (!next_fname) {
+            break; /* no more files */
+        }
         if (*next_fname == '+') {
             next_fname++;
             send_size = 1;
         } else {
             send_size = 0;
         }
-        size = readBinaryFile(next_fname);
+        size = readBinaryFile(next_fname, NULL, 0);
         if (size < 0)
         {
             printf("Could not open %s\n", next_fname);
@@ -617,36 +742,37 @@ int loadfile(char *fname, int address)
                 memcpy(&buffer[0x1c], &user_baud, 4);
             }
             tx((uint8_t *)buffer, num);
-            totnum += num;
             for (i = 0; i < num; i++) {
                 chksum += buffer[i];
             }
         }
         // receive checksum, verify it
-        int recv_chksum = 0;
-        wait_drain();
-        msleep(1+fifo_size*10*1000/loader_baud);
-        num = rx_timeout((uint8_t *)buffer, 3, 400);
-        if (num != 3) {
-            printf("ERROR: timeout waiting for checksum at end: got %d\n", num);
-            printf("Try increasing the FIFO setting if not large enough for your setup\n");
-            return 1;
-        }
-        recv_chksum = (buffer[0] - '@') << 4;
-        recv_chksum += (buffer[1] - '@');
-        chksum &= 0xff;
-        if (recv_chksum != (chksum & 0xff)) {
-            printf("ERROR: bad checksum, expected %02x got %02x (chksum characters %c%c%c)\n", chksum, recv_chksum, buffer[0], buffer[1], buffer[2]);
-            promptexit(1);
-        }
-        if (verbose) printf("chksum: %x OK\n", recv_chksum);
-        if (*fname) {
+        verify_chksum(chksum);
+        if (mem_argv_bytes || *fname) {
             // more files to send
             tx_raw_byte('+');
         } else {
             tx_raw_byte('-');
         }
+        wait_drain();
     } while (*fname);
+
+    if (mem_argv_bytes) {
+        /* send ARGv info to $FC000 */
+        if (verbose) printf("sending %d arg bytes\n", mem_argv_bytes);
+        tx_raw_long(ARGV_ADDR);
+        tx_raw_long(mem_argv_bytes);
+        chksum = 0;
+        for (int i = 0; i < mem_argv_bytes; i++) {
+            chksum += mem_argv_data[i];
+        }
+        tx((uint8_t *)mem_argv_data, mem_argv_bytes);
+        verify_chksum(chksum);
+        mem_argv_bytes = 0;
+        tx_raw_byte('-'); // all done
+        wait_drain();
+    }
+
     msleep(100);
     return 0;
 }
@@ -820,6 +946,15 @@ int main(int argc, char **argv)
                     Usage("Missing parameter for -p");
                 }
             }
+            else if (argv[i][1] == 'a' || !strcmp(argv[i], "--args"))
+            {
+                i++;
+                if (i >= argc) {
+                    // allow for 0 arguments to be explicitly passed
+                    argc++;
+                }
+                break;
+            }
             else if (argv[i][1] == 'b')
             {
                 if(argv[i][2])
@@ -954,7 +1089,10 @@ int main(int argc, char **argv)
                 load_mode = LOAD_FPGA;
             else if (!strcmp(argv[i], "-SINGLE"))
                 load_mode = LOAD_SINGLE;
-            else if (!strcmp(argv[i], "-NOZERO"))
+            else if (!strcmp(argv[i], "-SPI")) {
+                load_mode = LOAD_SPI;
+                use_checksum = 0; /* checksum calculation throws off flash loader */
+            } else if (!strcmp(argv[i], "-NOZERO"))
                 force_zero = 0;
             else if (!strcmp(argv[i], "-ZERO"))
                 force_zero = 1;
@@ -962,6 +1100,8 @@ int main(int argc, char **argv)
                 serial_use_rts_for_reset(0);
             else if (!strcmp(argv[i], "-RTS"))
                 serial_use_rts_for_reset(1);
+            else if (!strcmp(argv[i], "-NOEOF"))
+                ignoreEof = 1;
             else
             {
                 printf("Invalid option %s\n", argv[i]);
@@ -975,6 +1115,36 @@ int main(int argc, char **argv)
         }
     }
 
+    if (i < argc) {
+        int num_argc = 1;
+        mem_argv_bytes = 5; // for ARGv plus trailing 0
+        // find length of all arguments
+        for (int j = i; j < argc && argv[j]; j++) {
+            mem_argv_bytes += strlen(argv[j]) + 1; // include trailing 0
+            num_argc++;
+        }
+        if (mem_argv_bytes >= ARGV_MAX_BYTES) {
+            printf("Argument list too long (%d bytes, maximum is %d)\n",
+                   mem_argv_bytes, ARGV_MAX_BYTES);
+            promptexit(1);
+        }
+        if (num_argc >= ARGC_MAX_ITEMS) {
+            printf("Too many arguments (%d provided, maximum is %d)\n",
+                   num_argc, ARGC_MAX_ITEMS);
+            promptexit(1);
+        }
+        mem_argv_data = (char *)calloc(1, mem_argv_bytes);
+        char *ptr = mem_argv_data;
+        *ptr++ = 'A';
+        *ptr++ = 'R';
+        *ptr++ = 'G';
+        *ptr++ = 'v';
+        for (int j = i; j < argc && argv[j]; j++) {
+            strcpy(ptr, argv[j]);
+            ptr += strlen(argv[j]) + 1;
+        }
+        // do not have to 0 terminate, we used calloc above
+    }
     if (enter_rom) {
         if (fname) {
             printf("Entering ROM is incompatible with downloading a file\n");
